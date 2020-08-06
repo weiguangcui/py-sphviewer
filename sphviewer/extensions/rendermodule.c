@@ -1,3 +1,24 @@
+/*////////////////////////////////////////////////////////////////////
+    This file is part of Py-SPHViewer
+    
+    <Py-SPHVIewer is a framework for rendering particles in Python
+    using the SPH interpolation scheme.>
+    Copyright (C) <2013>  <Alejandro Benitez Llambay>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/////////////////////////////////////////////////////////////////////////*/
+
 #include <Python.h>
 
 //#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
@@ -9,6 +30,19 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+
+float *get_double_array(PyArrayObject *array_obj, int n){
+  /* This function returns the data stored in a double PyArrayObject*/
+  double *local_array = (double *)array_obj->data;  
+  float *output = (float *)malloc( n * sizeof(float) );
+
+#pragma omp parallel for firstprivate(n)
+  for(int i=0;i<n;i++){
+    output[i] = local_array[i];
+  }
+
+  return output;
+}
 
 
 float cubic_kernel(float r, float h){
@@ -25,11 +59,12 @@ float cubic_kernel(float r, float h){
 }
 
 
-void c_render(int *x, int *y, int *t, float *mass, 
+void c_render(float *x, float *y, float *t, float *mass, 
 	      int xsize, int ysize, int n, float *image){ 
   
   // C function calculating the image of the particles convolved with our kernel
   int size_lim;
+  int progress = 0;
  
   if(xsize >= ysize){
     size_lim = xsize;
@@ -62,47 +97,66 @@ void c_render(int *x, int *y, int *t, float *mass,
     }
   }
   
-
   // Let's compute the local image 
   //  for(i=(thread_id*ppt); i<(thread_id+1)*ppt; i++){
   for(l=0;l<ppt;l++){
     i = thread_id+nth*l;
-    xx = x[i];
-    yy = y[i];
-    tt = t[i];
+    xx = (int) x[i];
+    yy = (int) y[i];
+    tt = (int) t[i];
     mm = mass[i];
 
-    if(tt < 1) tt = 1;
+    if(tt <= 1) {
+      local_image[yy*xsize+xx] += mm;      
+      continue;
+    }
+    
     if(tt > size_lim) tt = size_lim;
+
     
     // Let's compute the convolution with the Kernel
     for(j=-tt; j<tt+1; j++){
       for(k=-tt; k<tt+1; k++){
 	if( ( (xx+j) >= 0) && ( (xx+j) < xsize) && ( (yy+k) >=0) && ( (yy+k) < ysize)){
-	  local_image[(yy+k)*xsize+(xx+j)] += mm*cubic_kernel(sqrt((float)j*(float)j+(float)k*(float)k), tt);
+	  local_image[(yy+k)*xsize+(xx+j)] += mm*cubic_kernel(sqrt((float)j*(float)j+(float)k*(float)k), tt); 
 	}
       }
     }
+
+  #pragma omp atomic
+    progress += 1;
+
+  if( (progress * 100 / n) % 4 == 0)
+    printf("\r[Py-SPHViewer]: Rendering progress = %d %%", progress* 100 / n);
+    fflush(stdout);
   }
   
   // Let's compute the image for the remainder particles...
   if((r-thread_id) > 0){
     i  = nth*ppt+thread_id;
-    xx = x[i];
-    yy = y[i];
-    tt = t[i];
+    xx = (int) x[i];
+    yy = (int) y[i];
+    tt = (int) t[i];
     mm = mass[i];
-    
-    if(tt < 1) tt = 1;
+
     if(tt > size_lim) tt = size_lim;
     
-    for(j=-tt; j<tt+1; j++){
-      for(k=-tt; k<tt+1; k++){
-	if( ( (xx+j) >= 0) && ( (xx+j) < xsize) && ( (yy+k) >=0) && ( (yy+k) < ysize)){
-	  local_image[(yy+k)*xsize+(xx+j)] += mm*cubic_kernel(sqrt((float)j*(float)j+(float)k*(float)k), tt);
+    if(tt <= 1){
+      local_image[yy*xsize+xx] += mm;
+    } else {
+  
+      for(j=-tt; j<tt+1; j++){
+	for(k=-tt; k<tt+1; k++){
+	  if( ( (xx+j) >= 0) && ( (xx+j) < xsize) && ( (yy+k) >=0) && ( (yy+k) < ysize)){
+	    local_image[(yy+k)*xsize+(xx+j)] += mm*cubic_kernel(sqrt((float)j*(float)j+(float)k*(float)k), tt);
+	  }
 	}
       }
     }
+
+  #pragma omp atomic
+    progress += 1;
+
   }
   // Let's merge the local images
   
@@ -117,6 +171,9 @@ void c_render(int *x, int *y, int *t, float *mass,
     free(local_image);
   }
   }
+
+  printf("\r[Py-SPHViewer]: Rendering progress = %d %%\n", progress * 100 / n);
+  fflush(stdout);
   return;
 }
 
@@ -162,23 +219,37 @@ void test_C(){
 static PyObject *rendermodule(PyObject *self, PyObject *args){
   PyArrayObject *x_obj, *y_obj, *t_obj;
   PyArrayObject *m_obj;
-  int *x, *y, *t;
+  float *x, *y, *t;
   float *mass;
   int xsize, ysize;
   int n;
   float *image;
+  int DOUBLE = 0;
 
   if(!PyArg_ParseTuple(args, "OOOOii",&x_obj, &y_obj, &t_obj, &m_obj, &xsize, &ysize))
     return NULL;
     
   // Let's check the size of the 1-dimensions arrays.
-  n = (int) x_obj->dimensions[0];
+  n = (int) m_obj->dimensions[0];
 
   // Let's point the C arrays to the numpy arrays
-  x = (int *)x_obj->data;
-  y = (int *)y_obj->data;
-  t = (int *)t_obj->data;
-  mass = (float *)m_obj->data;
+  x    = (float *)x_obj->data;
+  y    = (float *)y_obj->data; 
+  t    = (float *)t_obj->data; /* These are always floats, as they come from Scene */
+
+
+
+  /* Let's check the type of mass, which could be either double or float */
+  int type = PyArray_TYPE(m_obj);
+  if(type == NPY_FLOAT){
+    mass = (float *)m_obj->data;
+  }
+  else if(type == NPY_DOUBLE){
+    mass = get_double_array(m_obj, n);
+    DOUBLE = 1;
+  }else {
+    return NULL;
+  }
 
   image = (float *)malloc( xsize * ysize * sizeof(float) );
 
@@ -191,6 +262,8 @@ static PyObject *rendermodule(PyObject *self, PyObject *args){
 
   // Here we do the work
   c_render(x,y,t,mass,xsize,ysize,n,image);
+
+  if(DOUBLE) free(mass);
   
   // Let's build a numpy array
   npy_intp dims[1] = {xsize*ysize};
@@ -206,10 +279,32 @@ static PyMethodDef RenderMethods[] = {
   {NULL, NULL, 0, NULL}
 };
 
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "render",       /* m_name */
+    NULL,           /* m_doc */
+    -1,             /* m_size */
+    RenderMethods,  /* m_methods */
+    NULL,           /* m_reload */
+    NULL,           /* m_traverse */
+    NULL,           /* m_clear */
+    NULL,           /* m_free */
+};
+
+PyMODINIT_FUNC
+PyInit_render(void)
+{
+    PyObject *m = PyModule_Create(&moduledef);
+    import_array();
+    return m;
+}
+#else
 PyMODINIT_FUNC initrender(void) {
   (void) Py_InitModule("render", RenderMethods);
   import_array();
 }
+#endif
 
 
 // Uncomment the following lines for doing some test.

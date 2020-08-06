@@ -1,5 +1,21 @@
-//This code is part of py-sphviewer and it is included as a tool.
-//Author: Alejandro Benitez-Llambay
+//This file is part of Py-SPHViewer
+
+//<Py-SPHVIewer is a framework for rendering particles in Python
+//using the SPH interpolation scheme.>
+//Copyright (C) <2013>  <Alejandro Benitez Llambay>
+
+//This program is free software: you can redistribute it and/or modify
+//it under the terms of the GNU General Public License as published by
+//the Free Software Foundation, either version 3 of the License, or
+//(at your option) any later version.
+
+//This program is distributed in the hope that it will be useful,
+//but WITHOUT ANY WARRANTY; without even the implied warranty of
+//MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+//GNU General Public License for more details.
+
+//You should have received a copy of the GNU General Public License
+//along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <Python.h>
 
@@ -13,7 +29,7 @@
 #include <stdio.h>
 #include <time.h>
 
-float hsv_to_rgb(float h, float s, float v,
+void hsv_to_rgb(float h, float s, float v,
 		 float *r, float *g, float *b)
 //Function to convert from hsv to rgb color space.
 //Coded by Alejandro Benitez-Llambay as a tool for py-sphviewer. The implementation 
@@ -166,7 +182,29 @@ static PyMethodDef MakehsvMethods[] = {
   {NULL, NULL, 0, NULL}
 };
 
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "makehsv",      /* m_name */
+    NULL,           /* m_doc */
+    -1,             /* m_size */
+    MakehsvMethods, /* m_methods */
+    NULL,           /* m_reload */
+    NULL,           /* m_traverse */
+    NULL,           /* m_clear */
+    NULL,           /* m_free */
+};
+
+PyMODINIT_FUNC
+PyInit_makehsv(void)
+{
+    PyObject *m = PyModule_Create(&moduledef);
+    import_array();
+    return m;
+}
+#else
 PyMODINIT_FUNC initmakehsv(void) {
   (void) Py_InitModule("makehsv", MakehsvMethods);
   import_array();
 }
+#endif

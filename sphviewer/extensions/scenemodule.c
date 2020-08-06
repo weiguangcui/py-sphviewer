@@ -1,3 +1,24 @@
+/*////////////////////////////////////////////////////////////////////
+    This file is part of Py-SPHViewer
+    
+    <Py-SPHVIewer is a framework for rendering particles in Python
+    using the SPH interpolation scheme.>
+    Copyright (C) <2013>  <Alejandro Benitez Llambay>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+/////////////////////////////////////////////////////////////////////////*/
+
 #include <Python.h>
 //#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/ndarraytypes.h>
@@ -7,6 +28,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+
 
 void rx(float angle, float *x, float *y, float *z, int n){
   // counter-clockwise rotation matrix along x-axis  
@@ -50,6 +72,44 @@ void rz(float angle, float *x, float *y, float *z, int n){
   return;
 }
 
+float *get_float_array(PyArrayObject *array_obj, int n){
+  /* This function returns the data stored in a float PyArrayObject*/
+
+  /*We enfore C contiguous arrays*/
+  PyArrayObject *cont_obj = PyArray_ContiguousFromObject(array_obj, PyArray_FLOAT, 1, 3);
+
+  float *local_array = (float *)cont_obj->data;  
+  float *output = (float *)malloc( n * sizeof(float) );
+
+#pragma omp parallel for firstprivate(n)
+  for(int i=0;i<n;i++){
+    output[i] = local_array[i];
+  }
+
+  /* release memory */
+  Py_DECREF(cont_obj);
+  return output;
+}
+
+float *get_double_array(PyArrayObject *array_obj, int n){
+  /* This function returns the data stored in a double PyArrayObject*/
+
+  /*We enfore C contiguous arrays*/
+  PyArrayObject *cont_obj = PyArray_ContiguousFromObject(array_obj, PyArray_DOUBLE, 1, 3);
+
+  double *local_array = (double *)cont_obj->data;  
+  float *output = (float *)malloc( n * sizeof(float) );
+
+#pragma omp parallel for firstprivate(n)
+  for(int i=0;i<n;i++){
+    output[i] = local_array[i];
+  }
+
+  /* release memory */
+  Py_DECREF(cont_obj);
+  return output;
+}
+
 
 long int compute_scene(float *x, float *y, float *z, float *hsml, 
 		       float *extent, int xsize, int ysize,
@@ -82,7 +142,6 @@ long int compute_scene(float *x, float *y, float *z, float *hsml,
     ymin = extent[2];
     ymax = extent[3];
 
-    lbin = 2*xmax/xsize;
 
     for(i=0;i<n;i++){
       if( (x[i] >= xmin) & (x[i] <= xmax) & 
@@ -93,11 +152,11 @@ long int compute_scene(float *x, float *y, float *z, float *hsml,
       }
     }
 
-#pragma omp parallel for firstprivate(n,xmin,xmax,ymin,ymax,xsize,ysize,lbin)
+#pragma omp parallel for firstprivate(n,xmin,xmax,ymin,ymax,xsize,ysize)
     for(i=0;i<n;i++){
       x[i] = (x[i] - xmin) / (xmax-xmin) * xsize;
       y[i] = (y[i] - ymin) / (ymax-ymin) * ysize;
-      hsml[i] = hsml[i]/lbin;
+      hsml[i] = hsml[i]/(xmax-xmin) * xsize;
     }          
   }
   // If the camera is not at the infinity, let's put it at a certain 
@@ -121,8 +180,6 @@ long int compute_scene(float *x, float *y, float *z, float *hsml,
       extent[2] = yfovmin;
       extent[3] = yfovmax;
 
-      lbin = 2*xmax/xsize;
-      
       float zpart;
       for(i=0;i<n;i++){
 	zpart = (z[i]-(-1.0*r));
@@ -140,7 +197,7 @@ long int compute_scene(float *x, float *y, float *z, float *hsml,
 	zpart = (z[i]-(-1.0*r))/zoom;
 	x[i] = (x[i]/zpart - xmin) / (xmax-xmin) * xsize;
 	y[i] = (y[i]/zpart - ymin) / (ymax-ymin) * ysize;
-	hsml[i] = (hsml[i]/zpart)/lbin;
+	hsml[i] = (hsml[i]/zpart)/(xmax-xmin) * xsize;
       }
     }          
   return idx;
@@ -150,13 +207,13 @@ long int compute_scene(float *x, float *y, float *z, float *hsml,
 static PyObject *scenemodule(PyObject *self, PyObject *args){
 
   PyArrayObject *x_obj, *y_obj, *z_obj, *h_obj, *extent_obj;
-  float *x, *y, *z, *h;
+  float *xlocal, *ylocal, *zlocal, *hlocal, *extent;
   int n;
-  float *extent;
   float x0_cam, y0_cam, z0_cam;
   float r,t,p,roll,zoom;
   int xsize, ysize;
   int projection;
+  int i;
 
   if(!PyArg_ParseTuple(args, "OOOOffffffffOiii",
 		       &x_obj, &y_obj, &z_obj, &h_obj, 
@@ -165,34 +222,43 @@ static PyObject *scenemodule(PyObject *self, PyObject *args){
 		       &xsize, &ysize, &projection))
     return NULL;
 
-  n = (int) x_obj->dimensions[0];
+  n = (int) h_obj->dimensions[0];
+  
+  float * (* get_array) (PyArrayObject *, int); 
 
-  // Let's point to the data of the objects
-  x = (float *)x_obj->data;
-  y = (float *)y_obj->data;
-  z = (float *)z_obj->data;
-  h = (float *)h_obj->data;
-  extent = (float *)extent_obj->data;
-
-  // Let's make a local copy of the variables, just to preserve the input values
-  float *xlocal, *ylocal, *zlocal, *hlocal;
-  xlocal = (float *)malloc( n * sizeof(float) );
-  ylocal = (float *)malloc( n * sizeof(float) );
-  zlocal = (float *)malloc( n * sizeof(float) );
-  hlocal = (float *)malloc( n * sizeof(float) );
-
-  int i;
-#pragma omp parallel for firstprivate(n)
-  for(i=0;i<n;i++){
-    xlocal[i] = x[i];
-    ylocal[i] = y[i];
-    zlocal[i] = z[i];
-    hlocal[i] = h[i];
+  /* check positions data type */
+  int type = PyArray_TYPE(x_obj);
+  if(type == NPY_FLOAT){
+    get_array = get_float_array;
+  }
+  else if(type == NPY_DOUBLE){
+    get_array = get_double_array;
+  }else {
+    return NULL;
   }
 
+  xlocal = get_array(x_obj, n);
+  ylocal = get_array(y_obj, n);
+  zlocal = get_array(z_obj, n);
+
+  /* check positions data type */
+  type = PyArray_TYPE(h_obj);
+  if(type == NPY_FLOAT){
+    get_array = get_float_array;
+  }
+  else if(type == NPY_DOUBLE){
+    get_array = get_double_array;
+  }else {
+    return NULL;
+  }
+
+  hlocal = get_array(h_obj, n);
+
+
+  extent = (float *) extent_obj->data;
+
   // Let's do the job
-  long int *klocal;
-  klocal = (long int *)malloc( n * sizeof(long int) );
+  long int *klocal = (long int *)malloc( n * sizeof(long int) );
 
   //projection == 0 means r='infinity'
   long int idx = compute_scene(xlocal, ylocal, zlocal, hlocal, 
@@ -201,13 +267,10 @@ static PyObject *scenemodule(PyObject *self, PyObject *args){
 			       n, klocal, r, t, p, roll,
 			       zoom,projection);
 
-  float *x_out_c, *y_out_c, *h_out_c;
-  long int *k_out_c;
-
-  x_out_c = (float *)malloc( idx * sizeof(float) );
-  y_out_c = (float *)malloc( idx * sizeof(float) );
-  h_out_c = (float *)malloc( idx * sizeof(float) );
-  k_out_c = (long int*)malloc( idx * sizeof(long int) );
+  float *x_out_c    = (float *)malloc( idx * sizeof(float) );
+  float *y_out_c    = (float *)malloc( idx * sizeof(float) );
+  float *h_out_c    = (float *)malloc( idx * sizeof(float) );
+  long int *k_out_c = (long int*)malloc( idx * sizeof(long int) );
 
 #pragma omp parallel for firstprivate(n,idx)
   for(i=0;i<idx;i++){
@@ -253,8 +316,30 @@ static PyMethodDef SceneMethods[] = {
   {NULL, NULL, 0, NULL}
 };
 
+#if PY_MAJOR_VERSION >= 3
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "scene",        /* m_name */
+    NULL,           /* m_doc */
+    -1,             /* m_size */
+    SceneMethods,   /* m_methods */
+    NULL,           /* m_reload */
+    NULL,           /* m_traverse */
+    NULL,           /* m_clear */
+    NULL,           /* m_free */
+};
+
+PyMODINIT_FUNC
+PyInit_scene(void)
+{
+    PyObject *m = PyModule_Create(&moduledef);
+    import_array();
+    return m;
+}
+#else
 PyMODINIT_FUNC initscene(void) {
   (void) Py_InitModule("scene", SceneMethods);
   import_array();
 }
+#endif
 
